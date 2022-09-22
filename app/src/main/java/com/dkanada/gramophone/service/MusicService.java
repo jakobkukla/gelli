@@ -66,14 +66,10 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 import static com.google.android.exoplayer2.Player.MEDIA_ITEM_TRANSITION_REASON_AUTO;
-import static com.google.android.exoplayer2.Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED;
-import static com.google.android.exoplayer2.Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM;
 
 public class MusicService extends Service implements SharedPreferences.OnSharedPreferenceChangeListener {
     public static final String PACKAGE_NAME = BuildConfig.APPLICATION_ID;
@@ -100,9 +96,9 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
     public static final String REPEAT_MODE_CHANGED = PACKAGE_NAME + ".repeat.changed";
     public static final String SHUFFLE_MODE_CHANGED = PACKAGE_NAME + ".shuffle.changed";
 
-    public static final int TRACK_STARTED = 9;
     public static final int TRACK_CHANGED = 1;
-    public static final int TRACK_ENDED = 2;
+    public static final int TRACK_PROGRESS = 2;
+    public static final int TRACK_ENDED = 3;
 
     public static final int SAVE_QUEUE = 0;
     public static final int LOAD_QUEUE = 9;
@@ -118,6 +114,7 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
     private Playback playback;
 
     public QueueManager queueManager;
+    public ProgressReporter progressReporter = new ProgressReporter(this);
 
     private boolean queuesRestored;
 
@@ -128,9 +125,6 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
     private Handler uiThreadHandler;
     private ThrottledSeekHandler throttledSeekHandler;
     private QueueHandler queueHandler;
-    private ProgressHandler progressHandler;
-
-    private HandlerThread progressHandlerThread;
     private HandlerThread queueHandlerThread;
 
     public final QueueManager.QueueCallbacks queueCallbacks = new QueueManager.QueueCallbacks() {
@@ -158,7 +152,10 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
         public void onStateChanged(int state) {
             notifyChange(STATE_CHANGED);
 
+            progressReporter.handleProgress(TRACK_PROGRESS);
+
             if (state == Player.STATE_ENDED) {
+                progressReporter.handleProgress(TRACK_ENDED);
                 playingNotification.stop();
                 releaseWakeLock();
             }
@@ -168,11 +165,7 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
         public void onReadyChanged(boolean ready, int reason) {
             notifyChange(STATE_CHANGED);
 
-            if (ready) {
-                progressHandler.sendEmptyMessage(TRACK_STARTED);
-            } else if (reason == PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM) {
-                progressHandler.sendEmptyMessage(TRACK_ENDED);
-            }
+            progressReporter.handleProgress(TRACK_PROGRESS);
         }
 
         @Override
@@ -180,14 +173,18 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
             acquireWakeLock(30000);
 
             if (reason == MEDIA_ITEM_TRANSITION_REASON_AUTO) {
-                progressHandler.sendEmptyMessage(TRACK_CHANGED);
                 queueManager.setNextPosition();
-            } else if (reason == MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) {
-                progressHandler.sendEmptyMessage(TRACK_CHANGED);
             }
+
+            progressReporter.handleProgress(TRACK_CHANGED);
 
             notifyChange(STATE_CHANGED);
             notifyChange(META_CHANGED);
+        }
+
+        @Override
+        public void onProgressChanged(int reason) {
+            progressReporter.handleProgress(TRACK_PROGRESS);
         }
     };
 
@@ -240,10 +237,6 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
         playback.setListener(playbackCallbacks);
 
         queueManager = new QueueManager(this, queueCallbacks);
-
-        progressHandlerThread = new HandlerThread(ProgressHandler.class.getName());
-        progressHandlerThread.start();
-        progressHandler = new ProgressHandler(this, progressHandlerThread.getLooper());
 
         queueHandlerThread = new HandlerThread(QueueHandler.class.getName(), Process.THREAD_PRIORITY_BACKGROUND);
         queueHandlerThread.start();
@@ -378,7 +371,7 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
         unregisterReceiver(widgetIntentReceiver);
         unregisterReceiver(becomingNoisyReceiver);
 
-        progressHandler.sendEmptyMessage(TRACK_ENDED);
+        progressReporter.handleProgress(TRACK_ENDED);
         mediaSession.setActive(false);
         quit();
         releaseResources();
@@ -442,9 +435,6 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
     }
 
     private void releaseResources() {
-        progressHandler.removeCallbacksAndMessages(null);
-        progressHandlerThread.quitSafely();
-
         queueHandler.removeCallbacksAndMessages(null);
         queueHandlerThread.quitSafely();
 
@@ -704,39 +694,30 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
         }
     }
 
-    private static final class ProgressHandler extends Handler {
+    private static final class ProgressReporter {
         private final WeakReference<MusicService> mService;
 
-        private ScheduledExecutorService executorService;
-        private Future<?> task;
+        private final ExecutorService executorService = Executors.newSingleThreadExecutor();
 
-        public ProgressHandler(MusicService service, Looper looper) {
-            super(looper);
-
+        public ProgressReporter(MusicService service) {
             mService = new WeakReference<>(service);
         }
 
-        @Override
-        public void handleMessage(@NonNull final Message msg) {
+        public void handleProgress(int event) {
             Song song = mService.get().queueManager.getCurrentSong();
             if (song == null) return;
 
-            switch (msg.what) {
-                case TRACK_STARTED:
-                    onStart();
+            switch (event) {
                 case TRACK_CHANGED:
                     onNext();
+                    /* FALLTHROUGH */
+                case TRACK_PROGRESS:
+                    onProgress();
                     break;
                 case TRACK_ENDED:
                     onStop();
+                    break;
             }
-        }
-
-        public void onStart() {
-            if (executorService != null) executorService.shutdownNow();
-
-            executorService = Executors.newScheduledThreadPool(1);
-            task = executorService.scheduleAtFixedRate(this::onProgress, 10, 10, TimeUnit.SECONDS);
         }
 
         public void onNext() {
@@ -747,8 +728,10 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
             startInfo.setCanSeek(true);
             startInfo.setIsPaused(false);
 
-            App.getApiClient().ensureWebSocket();
-            App.getApiClient().ReportPlaybackStartAsync(startInfo, new EmptyResponse());
+            executorService.submit(() -> {
+                App.getApiClient().ensureWebSocket();
+                App.getApiClient().ReportPlaybackStartAsync(startInfo, new EmptyResponse());
+            });
         }
 
         public void onProgress() {
@@ -761,11 +744,10 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
                 return;
             }
 
-            // TODO these cause a wrong thread error
             long progress = mService.get().getSongProgressMillis();
             double duration = mService.get().getSongDurationMillis();
             if (progress / duration > 0.9) {
-                App.getApiClient().MarkPlayedAsync(current.id, user, time, new Response<>());
+                executorService.submit(() -> App.getApiClient().MarkPlayedAsync(current.id, user, time, new Response<>()));
             }
 
             progressInfo.setItemId(current.id);
@@ -775,18 +757,19 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
             progressInfo.setPlaySessionId(Integer.toString(current.id.hashCode()));
             progressInfo.setCanSeek(true);
 
-            App.getApiClient().ReportPlaybackProgressAsync(progressInfo, new EmptyResponse());
+            executorService.submit(() -> App.getApiClient().ReportPlaybackProgressAsync(progressInfo, new EmptyResponse()));
         }
 
         public void onStop() {
+            // TODO why is the client not disappearing in the dashboard?
+
             PlaybackStopInfo info = new PlaybackStopInfo();
             long progress = mService.get().getSongProgressMillis();
 
             info.setItemId(mService.get().queueManager.getCurrentSong().id);
             info.setPositionTicks(progress * 10000);
 
-            if (task != null) task.cancel(true);
-            if (executorService != null) executorService.shutdownNow();
+            executorService.submit(() -> App.getApiClient().ReportPlaybackStoppedAsync(info, new EmptyResponse()));
         }
     }
 }

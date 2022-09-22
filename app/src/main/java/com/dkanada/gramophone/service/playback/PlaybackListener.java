@@ -6,4 +6,6 @@ public interface PlaybackListener {
     void onReadyChanged(boolean ready, int reason);
 
     void onTrackChanged(int reason);
+
+    void onProgressChanged(int reason);
 }

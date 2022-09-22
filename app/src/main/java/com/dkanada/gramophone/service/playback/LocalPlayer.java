@@ -75,6 +75,7 @@ public class LocalPlayer implements Playback {
         @Override
         public void onPositionDiscontinuity(@NonNull Player.PositionInfo oldPosition, @NonNull Player.PositionInfo newPosition, int reason) {
             Log.i(TAG, String.format("onPositionDiscontinuity: %d", reason));
+            if (listener != null) listener.onProgressChanged(reason);
         }
 
         @Override
